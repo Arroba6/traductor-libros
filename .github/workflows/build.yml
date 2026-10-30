@@ -18,7 +18,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
@@ -27,7 +27,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y git zip unzip autoconf automake libtool pkg-config \
-            zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev
+            zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev libltdl-dev
           pip install --upgrade pip
           pip install buildozer==1.5.0 "cython==0.29.36" setuptools
 
@@ -40,7 +40,23 @@ jobs:
           key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
 
       - name: Compilar la APK
-        run: yes | buildozer -v android debug
+        shell: bash
+        run: |
+          set -o pipefail
+          yes | buildozer -v android debug 2>&1 | tee build.log
+
+      - name: Guardar el registro de errores
+        if: failure()
+        shell: bash
+        run: |
+          tail -n 600 build.log > registro.txt || echo "sin registro" > registro.txt
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git checkout --orphan registro-errores
+          git rm -rf --cached . > /dev/null
+          git add registro.txt
+          git commit -m "Registro de la compilación fallida"
+          git push -f origin registro-errores
 
       - name: Guardar la APK
         uses: actions/upload-artifact@v4

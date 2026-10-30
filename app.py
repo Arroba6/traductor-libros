@@ -488,6 +488,43 @@ KV = """
                 values: [i for i in app.IDIOMAS if i != 'Detectar']
                 disabled: root.trabajando
             Texto:
+                text: 'Traductor'
+                color: SUAVE
+            Selector:
+                id: motor
+                text: app.ajustes.get('motor', app.MOTORES[0])
+                values: app.MOTORES
+                disabled: root.trabajando
+            BoxLayout:
+                orientation: 'vertical'
+                size_hint_y: None
+                height: self.minimum_height if motor.text != app.MOTORES[0] else 0
+                opacity: 1 if motor.text != app.MOTORES[0] else 0
+                disabled: motor.text == app.MOTORES[0] or root.trabajando
+                spacing: dp(8)
+                Texto:
+                    text: ('Clave de DeepL. Créate una cuenta gratis en deepl.com («API Free»), ve a «Claves API» y cópiala aquí.' if 'DeepL' in motor.text else 'Clave y región de Microsoft. Se consiguen creando un recurso «Translator» gratuito (F0) en portal.azure.com; pide tarjeta para verificar, pero el plan F0 no cobra.')
+                    color: SUAVE
+                    font_size: '13sp'
+                Campo:
+                    id: clave
+                    hint_text: 'Pega aquí tu clave'
+                    text: app.ajustes.get('clave_deepl' if 'DeepL' in motor.text else 'clave_ms', '')
+                    password: True
+                Campo:
+                    id: region
+                    hint_text: 'Región (por ejemplo: westeurope)'
+                    text: app.ajustes.get('region_ms', '')
+                    height: dp(48) if 'Microsoft' in motor.text else 0
+                    opacity: 1 if 'Microsoft' in motor.text else 0
+                Boton:
+                    text: 'Abrir la web para conseguir la clave'
+                    on_release: app.abrir_web('https://www.deepl.com/pro-api' if 'DeepL' in motor.text else 'https://portal.azure.com/#create/Microsoft.CognitiveServicesTextTranslation')
+            Texto:
+                text: 'Gratis, sin cuenta. Va despacio a propósito para que Google no la bloquee.' if motor.text == app.MOTORES[0] else ('Gratis hasta 500.000 caracteres al mes. Muy buena calidad.' if 'DeepL' in motor.text else 'Gratis hasta 2 millones de caracteres al mes.')
+                color: SUAVE
+                font_size: '13sp'
+            Texto:
                 text: 'Resultado'
                 color: SUAVE
             BoxLayout:
@@ -523,7 +560,7 @@ KV = """
             BotonAcento:
                 text: 'Traduciendo…' if root.trabajando else ('Continuar traducción' if root.error else 'Empezar a traducir')
                 disabled: root.trabajando
-                on_release: root.empezar(origen.text, destino.text, 'bilingue' if modo_bil.state == 'down' else 'traducido')
+                on_release: root.empezar(origen.text, destino.text, 'bilingue' if modo_bil.state == 'down' else 'traducido', motor.text, clave.text, region.text)
             ProgressBar:
                 max: 1
                 value: root.progreso
@@ -679,10 +716,17 @@ class PantallaTraducir(ConLibro):
         self.error = ""
         self.resultado = ""
 
-    def empezar(self, origen, destino, modo):
+    def empezar(self, origen, destino, modo, motor, clave, region):
         app = App.get_running_app()
-        app.ajustes = {"origen": origen, "destino": destino, "modo": modo}
-        app.biblio.datos["ajustes"] = dict(app.ajustes)
+        aj = dict(app.ajustes)
+        aj.update({"origen": origen, "destino": destino, "modo": modo, "motor": motor})
+        if "DeepL" in motor:
+            aj["clave_deepl"] = clave.strip()
+        elif "Microsoft" in motor:
+            aj["clave_ms"] = clave.strip()
+            aj["region_ms"] = region.strip()
+        app.ajustes = aj
+        app.biblio.datos["ajustes"] = dict(aj)
         app.biblio.guardar()
         self.error = ""
         self.resultado = ""
@@ -692,15 +736,17 @@ class PantallaTraducir(ConLibro):
         self._cancelar = threading.Event()
         app.android.pantalla_encendida(True)
         threading.Thread(target=self._trabajo, daemon=True,
-                         args=(dict(self.libro), T.IDIOMAS[origen], T.IDIOMAS[destino], modo)).start()
+                         args=(dict(self.libro), T.IDIOMAS[origen], T.IDIOMAS[destino], modo,
+                               T.MOTORES[motor], clave.strip(), region.strip())).start()
 
-    def _trabajo(self, libro, origen, destino, modo):
+    def _trabajo(self, libro, origen, destino, modo, motor="google", clave="", region=""):
         app = App.get_running_app()
         try:
             if origen != "auto" and origen == destino:
                 raise T.MismoIdioma(origen)
             tr = T.Traductor(origen, destino, app.biblio.cache_dir,
-                             aviso=self._aviso, cancelar=self._cancelar)
+                             aviso=self._aviso, cancelar=self._cancelar,
+                             motor=motor, clave=clave, region=region)
             tr.abrir_cache(libro["id"])
             ext = os.path.splitext(libro["archivo"])[1]
             tmp = os.path.join(app.biblio.importar_dir, f"trad_{libro['id']}{ext}")
@@ -758,6 +804,7 @@ class TraductorLibrosApp(App):
     SIN_ESTANTERIA = SIN_ESTANTERIA
     NUEVA = NUEVA
     IDIOMAS = list(T.IDIOMAS.keys())
+    MOTORES = list(T.MOTORES.keys())
     estanterias = ListProperty([])
     libros_visibles = NumericProperty(0)
     ajustes = DictProperty({})
@@ -842,6 +889,19 @@ class TraductorLibrosApp(App):
     def abrir_traduccion(self, libro):
         self.sm.get_screen("traducir").preparar(libro)
         self.ir("traducir")
+
+    def abrir_web(self, url):
+        try:
+            if ANDROID:
+                from jnius import autoclass
+                Intent = autoclass("android.content.Intent")
+                Uri = autoclass("android.net.Uri")
+                self.android.ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+            else:
+                import webbrowser
+                webbrowser.open(url)
+        except Exception as e:
+            self.aviso(f"No se pudo abrir el navegador: {e}", 6)
 
     def exportar(self, libro):
         if not libro:

@@ -11,6 +11,7 @@ Funciona como el plugin "Ebook Translator" de Calibre:
 import hashlib
 import json
 import os
+import random
 import re
 import ssl
 import time
@@ -59,18 +60,37 @@ class MismoIdioma(Exception):
 
 
 # ---------------------------------------------------------------- traductor
-class Traductor:
-    URL = "https://translate.googleapis.com/translate_a/single"
+MOTORES = {
+    "Google (gratis, sin cuenta)": "google",
+    "DeepL (clave gratis)": "deepl",
+    "Microsoft (clave gratis)": "microsoft",
+}
 
-    def __init__(self, origen, destino, carpeta_cache, prueba=False, aviso=None, cancelar=None):
+# Códigos que usa cada traductor (los de Google son los de IDIOMAS)
+_DEEPL_DESTINO = {"en": "EN-US", "pt": "PT-PT", "zh-CN": "ZH-HANS"}
+_MS = {"zh-CN": "zh-Hans"}
+
+
+class Traductor:
+    URL_GOOGLE = "https://translate.googleapis.com/translate_a/single"
+    URL_MS = "https://api.cognitive.microsofttranslator.com/translate"
+
+    def __init__(self, origen, destino, carpeta_cache, prueba=False, aviso=None,
+                 cancelar=None, motor="google", clave="", region=""):
         self.origen, self.destino = origen, destino
         self.prueba = prueba
         self.aviso = aviso            # función para mostrar mensajes de espera
         self.cancelar = cancelar      # threading.Event para cancelar
+        self.motor = motor
+        self.clave = (clave or "").strip()
+        self.region = (region or "").strip()
         self.comprobado = False       # ya se miró el idioma detectado
+        self.pausa = 1.5              # segundos entre peticiones a Google
         self.carpeta_cache = carpeta_cache
         self.cache = {}
         self.ruta_cache = None
+        if motor in ("deepl", "microsoft") and not self.clave and not prueba:
+            raise RuntimeError("Falta la clave del traductor. Pégala en «Clave» o elige Google.")
 
     # caché por libro e idiomas
     def abrir_cache(self, id_libro):
@@ -95,6 +115,7 @@ class Traductor:
     def _clave(t):
         return hashlib.sha1(t.encode("utf-8")).hexdigest()
 
+    # ------------------------------------------------------------ esperas
     def _esperar(self, segundos, motivo):
         fin = time.time() + segundos
         while True:
@@ -109,40 +130,58 @@ class Traductor:
             else:
                 time.sleep(min(1, falta))
 
-    def _peticion(self, texto):
-        if self.prueba:
-            return "\n".join(f"[{self.destino}] {l}" for l in texto.split("\n"))
-        datos = urllib.parse.urlencode({
-            "client": "gtx", "sl": self.origen, "tl": self.destino,
-            "dt": "t", "q": texto}).encode("utf-8")
-        req = urllib.request.Request(self.URL, data=datos, headers={
-            "User-Agent": "Mozilla/5.0 (Linux; Android 14)",
-            "Content-Type": "application/x-www-form-urlencoded;charset=utf-8"})
+    def _dormir(self, segundos):
+        if self.cancelar is not None:
+            if self.cancelar.wait(segundos):
+                raise Cancelado()
+        else:
+            time.sleep(segundos)
+
+    def _comprobar(self, detectado):
+        if self.comprobado:
+            return
+        self.comprobado = True
+        origen = (detectado or "").lower() if self.origen == "auto" else self.origen
+        if origen and origen.split("-")[0] == self.destino.split("-")[0].lower():
+            raise MismoIdioma(origen)
+
+    def _enviar(self, req, nombre):
+        """Hace la petición con reintentos. Devuelve el JSON de la respuesta."""
         fallos = 0
         while True:
             if self.cancelar is not None and self.cancelar.is_set():
                 raise Cancelado()
             try:
-                with urllib.request.urlopen(req, timeout=30, context=_SSL) as r:
+                with urllib.request.urlopen(req, timeout=40, context=_SSL) as r:
                     j = json.loads(r.read().decode("utf-8"))
                 if self.aviso and fallos:
                     self.aviso("")
-                self._comprobar_idioma(j)
-                time.sleep(0.25)
-                return "".join(s[0] for s in (j[0] or []) if s and s[0])
-            except (Cancelado, MismoIdioma):
-                raise
+                return j
             except urllib.error.HTTPError as e:
                 fallos += 1
+                if e.code in (401, 403) and self.motor != "google":
+                    if self.motor == "microsoft" and e.code == 403:
+                        raise RuntimeError("Microsoft dice que has gastado los caracteres gratis "
+                                           "de este mes, o que la región no es correcta.")
+                    raise RuntimeError(f"{nombre} no acepta la clave. Revisa que esté bien copiada"
+                                       + (" y que la región sea la correcta." if self.motor == "microsoft" else "."))
+                if e.code == 456:
+                    raise RuntimeError("Has gastado los caracteres gratis de DeepL de este mes. "
+                                       "Elige otro traductor y pulsa «Continuar».")
+                if e.code == 400:
+                    raise RuntimeError(f"{nombre} no admite esta combinación de idiomas. Prueba con Google.")
                 if e.code == 429:
-                    # Google pide una pausa: esperar cada vez más (hasta 5 min) y seguir
+                    if self.motor == "google":
+                        self.pausa = min(self.pausa * 1.5, 8)   # a partir de ahora, más despacio
                     self._esperar(min(30 * fallos, 300),
-                                  "Google ha pedido una pausa por traducir mucho seguido.")
+                                  f"{nombre} ha pedido una pausa por traducir mucho seguido.")
                 else:
                     if fallos > 12:
-                        raise RuntimeError(f"El traductor respondió con un error ({e.code}). "
+                        raise RuntimeError(f"{nombre} respondió con un error ({e.code}). "
                                            "Pulsa «Continuar» más tarde.")
-                    self._esperar(min(5 * fallos, 60), f"Error del traductor ({e.code}).")
+                    self._esperar(min(5 * fallos, 60), f"Error de {nombre} ({e.code}).")
+            except (Cancelado, MismoIdioma):
+                raise
             except Exception:
                 fallos += 1
                 if fallos > 20:
@@ -150,18 +189,75 @@ class Traductor:
                                        "y pulsa «Continuar»: seguirá donde se quedó.")
                 self._esperar(min(5 * fallos, 60), "Sin conexión con el traductor.")
 
-    def _comprobar_idioma(self, j):
-        if self.comprobado:
-            return
-        self.comprobado = True
-        detectado = j[2] if len(j) > 2 and isinstance(j[2], str) else None
-        origen = detectado if self.origen == "auto" else self.origen
-        if origen and origen.split("-")[0] == self.destino.split("-")[0]:
-            raise MismoIdioma(origen)
+    # ------------------------------------------------------------ motores
+    def _google(self, textos):
+        texto = "\n".join(textos)
+        if self.prueba:
+            res = [f"[{self.destino}] {t}" for t in textos]
+        else:
+            datos = urllib.parse.urlencode({
+                "client": "gtx", "sl": self.origen, "tl": self.destino,
+                "dt": "t", "q": texto}).encode("utf-8")
+            req = urllib.request.Request(self.URL_GOOGLE, data=datos, headers={
+                "User-Agent": "Mozilla/5.0 (Linux; Android 14)",
+                "Content-Type": "application/x-www-form-urlencoded;charset=utf-8"})
+            j = self._enviar(req, "Google")
+            self._comprobar(j[2] if len(j) > 2 and isinstance(j[2], str) else None)
+            junto = "".join(s[0] for s in (j[0] or []) if s and s[0])
+            res = [p.strip() for p in junto.split("\n")]
+            self._dormir(self.pausa + random.uniform(0, 1))
+        if len(res) != len(textos):
+            if len(textos) == 1:
+                return [" ".join(res)]
+            return [self._google([t])[0] for t in textos]
+        return res
+
+    def _deepl(self, textos):
+        if self.prueba:
+            return [f"[{self.destino}] {t}" for t in textos]
+        host = "api-free.deepl.com" if self.clave.endswith(":fx") else "api.deepl.com"
+        campos = [("text", t) for t in textos]
+        campos.append(("target_lang", _DEEPL_DESTINO.get(self.destino, self.destino.upper())))
+        if self.origen != "auto":
+            campos.append(("source_lang", self.origen.split("-")[0].upper()))
+        req = urllib.request.Request(
+            f"https://{host}/v2/translate", data=urllib.parse.urlencode(campos).encode("utf-8"),
+            headers={"Authorization": f"DeepL-Auth-Key {self.clave}",
+                     "Content-Type": "application/x-www-form-urlencoded"})
+        j = self._enviar(req, "DeepL")
+        trad = j.get("translations", [])
+        if trad:
+            self._comprobar(trad[0].get("detected_source_language"))
+        return [x.get("text", "") for x in trad]
+
+    def _microsoft(self, textos):
+        if self.prueba:
+            return [f"[{self.destino}] {t}" for t in textos]
+        params = {"api-version": "3.0", "to": _MS.get(self.destino, self.destino)}
+        if self.origen != "auto":
+            params["from"] = _MS.get(self.origen, self.origen)
+        cabeceras = {"Ocp-Apim-Subscription-Key": self.clave,
+                     "Content-Type": "application/json; charset=UTF-8"}
+        if self.region:
+            cabeceras["Ocp-Apim-Subscription-Region"] = self.region
+        req = urllib.request.Request(
+            self.URL_MS + "?" + urllib.parse.urlencode(params),
+            data=json.dumps([{"Text": t} for t in textos]).encode("utf-8"), headers=cabeceras)
+        j = self._enviar(req, "Microsoft")
+        if j:
+            self._comprobar((j[0].get("detectedLanguage") or {}).get("language"))
+        return [x["translations"][0]["text"] for x in j]
+
+    def _lote(self, textos):
+        if self.motor == "deepl":
+            return self._deepl(textos)
+        if self.motor == "microsoft":
+            return self._microsoft(textos)
+        return self._google(textos)
 
     def _texto_largo(self, t):
         if len(t) <= LIMITE:
-            return self._peticion(t).strip()
+            return self._lote([t])[0].strip()
         frases = re.split(r"(?<=[.!?…;:])\s+", t)
         trozos, actual = [], ""
         for fr in frases:
@@ -174,7 +270,7 @@ class Traductor:
             actual = (actual + " " + fr).strip()
         if actual:
             trozos.append(actual)
-        return " ".join(self._peticion(x).strip() for x in trozos)
+        return " ".join(self._lote([x])[0].strip() for x in trozos)
 
     def traducir_lista(self, textos, avance=None, cancelar=None):
         """Traduce una lista de textos agrupándolos en pocas peticiones."""
@@ -189,6 +285,10 @@ class Traductor:
         if avance:
             avance(sum(len(textos[i]) for i in range(len(textos)) if salida[i] is not None))
 
+        # Google: hasta 4000 caracteres por petición. DeepL y Microsoft: lotes más grandes.
+        maximo = LIMITE if self.motor == "google" else 20000
+        max_textos = 50
+
         def enviar(grupo):
             if not grupo:
                 return
@@ -197,12 +297,9 @@ class Traductor:
             if len(grupo) == 1:
                 res = [self._texto_largo(textos[grupo[0]])]
             else:
-                partes = self._peticion("\n".join(textos[i] for i in grupo)).split("\n")
-                partes = [p.strip() for p in partes]
-                if len(partes) != len(grupo):
+                res = self._lote([textos[i] for i in grupo])
+                if len(res) != len(grupo):
                     res = [self._texto_largo(textos[i]) for i in grupo]
-                else:
-                    res = partes
             for i, r in zip(grupo, res):
                 salida[i] = r
                 self.cache[self._clave(textos[i])] = r
@@ -217,7 +314,7 @@ class Traductor:
                 grupo, tam = [], 0
                 enviar([i])
                 continue
-            if tam + len(t) + 1 > LIMITE or len(grupo) >= 50:
+            if tam + len(t) + 1 > maximo or len(grupo) >= max_textos:
                 enviar(grupo)
                 grupo, tam = [], 0
             grupo.append(i)

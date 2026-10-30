@@ -5,7 +5,7 @@ package.domain = io.github.arroba6
 source.dir = .
 source.include_exts = py,png,jpg,kv,json
 source.exclude_dirs = bin,.buildozer,.github
-version = 1.2
+version = 1.3
 requirements = python3,kivy==2.3.0,beautifulsoup4==4.12.3,soupsieve==2.5,typing_extensions,certifi,openssl,pyjnius,android
 orientation = portrait
 fullscreen = 0

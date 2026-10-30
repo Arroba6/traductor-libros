@@ -533,6 +533,11 @@ KV = """
                 text: root.estado
                 halign: 'center'
             Texto:
+                text: root.espera
+                color: (0.95, 0.8, 0.5, 1)
+                font_size: '13sp'
+                halign: 'center'
+            Texto:
                 text: root.error
                 color: (1, 0.55, 0.55, 1)
                 font_size: '13sp'
@@ -663,6 +668,7 @@ class PantallaTraducir(ConLibro):
     estado = StringProperty("")
     error = StringProperty("")
     resultado = StringProperty("")
+    espera = StringProperty("")
 
     def preparar(self, libro):
         if self.trabajando:
@@ -680,6 +686,7 @@ class PantallaTraducir(ConLibro):
         app.biblio.guardar()
         self.error = ""
         self.resultado = ""
+        self.espera = ""
         self.trabajando = True
         self.estado = "Preparando el libro…"
         self._cancelar = threading.Event()
@@ -690,7 +697,10 @@ class PantallaTraducir(ConLibro):
     def _trabajo(self, libro, origen, destino, modo):
         app = App.get_running_app()
         try:
-            tr = T.Traductor(origen, destino, app.biblio.cache_dir)
+            if origen != "auto" and origen == destino:
+                raise T.MismoIdioma(origen)
+            tr = T.Traductor(origen, destino, app.biblio.cache_dir,
+                             aviso=self._aviso, cancelar=self._cancelar)
             tr.abrir_cache(libro["id"])
             ext = os.path.splitext(libro["archivo"])[1]
             tmp = os.path.join(app.biblio.importar_dir, f"trad_{libro['id']}{ext}")
@@ -698,6 +708,10 @@ class PantallaTraducir(ConLibro):
             base = os.path.splitext(libro.get("nombre_original") or libro["titulo"])[0]
             sufijo = f"_bilingue_{destino}" if modo == "bilingue" else f"_{destino}"
             self._terminado(tmp, base + sufijo + ext, libro["id"])
+        except T.MismoIdioma:
+            nombre = next((k for k, v in T.IDIOMAS.items() if v == destino), destino)
+            self._fallo("El libro ya está en %s. Elige otro idioma en «Al idioma»." % nombre.lower(),
+                        "No hace falta traducirlo")
         except T.Cancelado:
             self._fallo("", "Traducción en pausa. Pulsa «Continuar» cuando quieras.")
         except Exception as e:
@@ -706,7 +720,13 @@ class PantallaTraducir(ConLibro):
     @mainthread
     def _avance(self, valor, texto):
         self.progreso = valor
-        self.estado = f"{texto}  ·  {int(valor * 100)} %"
+        self._ultimo = f"{texto}  ·  {int(valor * 100)} %"
+        self.estado = self._ultimo
+        self.espera = ""
+
+    @mainthread
+    def _aviso(self, texto):
+        self.espera = texto
 
     @mainthread
     def _terminado(self, tmp, nombre, id_origen):
@@ -722,6 +742,7 @@ class PantallaTraducir(ConLibro):
     @mainthread
     def _fallo(self, error, estado):
         self.trabajando = False
+        self.espera = ""
         App.get_running_app().android.pantalla_encendida(False)
         self.error = error or " "
         self.estado = estado

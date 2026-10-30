@@ -54,13 +54,20 @@ class Cancelado(Exception):
     pass
 
 
+class MismoIdioma(Exception):
+    """El libro ya está en el idioma de destino."""
+
+
 # ---------------------------------------------------------------- traductor
 class Traductor:
     URL = "https://translate.googleapis.com/translate_a/single"
 
-    def __init__(self, origen, destino, carpeta_cache, prueba=False):
+    def __init__(self, origen, destino, carpeta_cache, prueba=False, aviso=None, cancelar=None):
         self.origen, self.destino = origen, destino
         self.prueba = prueba
+        self.aviso = aviso            # función para mostrar mensajes de espera
+        self.cancelar = cancelar      # threading.Event para cancelar
+        self.comprobado = False       # ya se miró el idioma detectado
         self.carpeta_cache = carpeta_cache
         self.cache = {}
         self.ruta_cache = None
@@ -88,6 +95,20 @@ class Traductor:
     def _clave(t):
         return hashlib.sha1(t.encode("utf-8")).hexdigest()
 
+    def _esperar(self, segundos, motivo):
+        fin = time.time() + segundos
+        while True:
+            falta = int(fin - time.time())
+            if falta <= 0:
+                return
+            if self.aviso:
+                self.aviso(f"{motivo} Reintento en {falta} s…")
+            if self.cancelar is not None:
+                if self.cancelar.wait(min(1, falta)):
+                    raise Cancelado()
+            else:
+                time.sleep(min(1, falta))
+
     def _peticion(self, texto):
         if self.prueba:
             return "\n".join(f"[{self.destino}] {l}" for l in texto.split("\n"))
@@ -97,22 +118,46 @@ class Traductor:
         req = urllib.request.Request(self.URL, data=datos, headers={
             "User-Agent": "Mozilla/5.0 (Linux; Android 14)",
             "Content-Type": "application/x-www-form-urlencoded;charset=utf-8"})
-        ultimo = None
-        for intento in range(8):
+        fallos = 0
+        while True:
+            if self.cancelar is not None and self.cancelar.is_set():
+                raise Cancelado()
             try:
-                with urllib.request.urlopen(req, timeout=40, context=_SSL) as r:
+                with urllib.request.urlopen(req, timeout=30, context=_SSL) as r:
                     j = json.loads(r.read().decode("utf-8"))
+                if self.aviso and fallos:
+                    self.aviso("")
+                self._comprobar_idioma(j)
                 time.sleep(0.25)
                 return "".join(s[0] for s in (j[0] or []) if s and s[0])
+            except (Cancelado, MismoIdioma):
+                raise
             except urllib.error.HTTPError as e:
-                ultimo = e
-                time.sleep(10 * (intento + 1) if e.code == 429 else 2 * (intento + 1))
-            except Exception as e:
-                ultimo = e
-                time.sleep(3 * (intento + 1))
-        raise RuntimeError(
-            "No se pudo conectar con el traductor. Revisa tu conexión a internet "
-            f"y vuelve a pulsar Traducir: continuará donde se quedó. ({ultimo})")
+                fallos += 1
+                if e.code == 429:
+                    # Google pide una pausa: esperar cada vez más (hasta 5 min) y seguir
+                    self._esperar(min(30 * fallos, 300),
+                                  "Google ha pedido una pausa por traducir mucho seguido.")
+                else:
+                    if fallos > 12:
+                        raise RuntimeError(f"El traductor respondió con un error ({e.code}). "
+                                           "Pulsa «Continuar» más tarde.")
+                    self._esperar(min(5 * fallos, 60), f"Error del traductor ({e.code}).")
+            except Exception:
+                fallos += 1
+                if fallos > 20:
+                    raise RuntimeError("No hay conexión con el traductor. Revisa internet "
+                                       "y pulsa «Continuar»: seguirá donde se quedó.")
+                self._esperar(min(5 * fallos, 60), "Sin conexión con el traductor.")
+
+    def _comprobar_idioma(self, j):
+        if self.comprobado:
+            return
+        self.comprobado = True
+        detectado = j[2] if len(j) > 2 and isinstance(j[2], str) else None
+        origen = detectado if self.origen == "auto" else self.origen
+        if origen and origen.split("-")[0] == self.destino.split("-")[0]:
+            raise MismoIdioma(origen)
 
     def _texto_largo(self, t):
         if len(t) <= LIMITE:

@@ -42,8 +42,11 @@ jobs:
       - name: Compilar la APK
         shell: bash
         run: |
-          set -o pipefail
-          yes | buildozer -v android debug 2>&1 | tee build.log
+          set +e
+          yes | buildozer -v android debug > build.log 2>&1
+          codigo=${PIPESTATUS[1]}
+          tail -n 40 build.log
+          exit $codigo
 
       - name: Guardar el registro de errores
         if: failure()
